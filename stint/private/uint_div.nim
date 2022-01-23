@@ -13,8 +13,32 @@ import
   # Internal
   ./datatypes,
   ./uint_bitwise,
-  ./uint_shift,
   ./primitives/[addcarry_subborrow, extended_precision]
+
+# Helpers
+# --------------------------------------------------------
+
+func usedBitsAndWords(a: openArray[Word]): tuple[bits, words: int] {.inline.} =
+  ## Returns the number of used words and bits in a bigInt
+  var clz = 0
+  # Count Leading Zeros
+  for i in countdown(a.len-1, 0):
+    let count = log2trunc(a[i])
+    # debugEcho "count: ", count, ", a[", i, "]: ", a[i].toBin(64)
+    if count == -1:
+      clz += WordBitWidth
+    else:
+      clz += WordBitWidth - count - 1
+      return (a.len*WordBitWidth - clz, i+1)
+
+func copyWords(
+       a: var openArray[Word], startA: int,
+       b: openArray[Word], startB: int,
+       numWords: int) =
+  ## Copy a slice of B into A. This properly deals
+  ## with overlaps when A and B are slices of the same buffer
+  for i in countdown(numWords-1, 0):
+    a[startA+i] = b[startB+i]
 
 # Division
 # --------------------------------------------------------
@@ -37,206 +61,174 @@ func shortDiv*(a: var Limbs, k: Word): Word =
     # Undo normalization
     result = result shr clz
 
-# func binaryShiftDiv[qLen, rLen, uLen, vLen: static int](
-#        q: var Limbs[qLen],
-#        r: var Limbs[rLen],
-#        u: Limbs[uLen],
-#        v: Limbs[vLen]) =
-#   ## Division for multi-precision unsigned uint
-#   ## Implementation through binary shift division
-#   doAssert y.isZero.not() # This should be checked on release mode in the divmod caller proc
-
-#   type SubTy = type x.lo
-
-#   var
-#     shift = y.leadingZeros - x.leadingZeros
-#     d = y shl shift
-
-#   r = x
-
-#   while shift >= 0:
-#     q += q
-#     if r >= d:
-#       r -= d
-#       q.lo = q.lo or one(SubTy)
-
-#     d = d shr 1
-#     dec(shift)
-
-func knuthDivLE(
-       q: var StUint,
-       r: var StUint,
-       u: StUint,
-       v: StUint,
-       needRemainder: bool) =
-  ## Compute the quotient and remainder (if needed)
-  ## of the division of u by v
+func shlAddMod_multi(a: var openArray[Word], c: Word,
+                     M: openArray[Word], mBits: int): Word =
+  ## Fused modular left-shift + add
+  ## Shift input `a` by a word and add `c` modulo `M`
+  ## 
+  ## Specialized for M being a multi-precision integer.
   ##
-  ## - q must be of size uLen - vLen + 1 (assuming u and v uses all words)
-  ## - r must be of size vLen (assuming v uses all words)
-  ## - uLen >= vLen
+  ## With a word W = 2^WordBitWidth and a modulus M
+  ## Does a <- a * W + c (mod M)
+  ## and returns q = (a * W + c ) / M
   ##
-  ## For now only LittleEndian is implemented
-  #
-  # Resources at the bottom of the file
-
-  const
-    qLen = q.limbs.len
-    rLen = r.limbs.len
-    uLen = u.limbs.len
-    vLen = v.limbs.len
-
-  template `[]`(a: Stuint, i: int): Word = a.limbs[i]
-  template `[]=`(a: Stuint, i: int, val: Word) = a.limbs[i] = val
-
-  # Find the most significant word with actual set bits
-  # and get the leading zero count there
-  var divisorLen = vLen
-  var clz: int
-  for w in mostToLeastSig(v):
-    if w != 0:
-      clz = leadingZeros(w)
-      break
-    else:
-      divisorLen -= 1
-
-  doAssert divisorLen != 0, "Division by zero. Abandon ship!"
-
-  # Divisor is a single word.
-  if divisorLen == 1:
-    q.copyFrom(u)
-    r.leastSignificantWord() = q.limbs.shortDiv(v.leastSignificantWord())
-    # zero all but the least significant word
-    var lsw = true
-    for w in leastToMostSig(r):
-      if lsw:
-        lsw = false
-      else:
-        w = 0
-    return
-
-  var un {.noInit.}: Limbs[uLen+1]
-  var vn {.noInit.}: Limbs[vLen] # [mswLen .. vLen] range is unused
-
-  # Normalize so that the divisor MSB is set,
-  # vn cannot overflow, un can overflowed by 1 word at most, hence uLen+1
-  un.shlSmallOverflowing(u.limbs, clz)
-  vn.shlSmall(v.limbs, clz)
-
-  static: doAssert cpuEndian == littleEndian, "Currently the division algorithm requires little endian ordering of the limbs"
-  # TODO: is it worth it to have the uint be the exact same extended precision representation
-  # as a wide int (say uint128 or uint256)?
-  # in big-endian, the following loop must go the other way and the -1 must be +1
+  ## The modulus `M` most-significant bit at `mBits` MUST be set.
   
-  let vhi = vn[divisorLen-1]
-  let vlo = vn[divisorLen-2]
-  
-  for j in countdown(uLen - divisorLen, 0, 1):
-    # Compute qhat estimate of q[j] (off by 0, 1 and rarely 2)
-    var qhat, rhat: Word
-    let uhi = un[j+divisorLen]
-    let ulo = un[j+divisorLen-1]
-    div2n1n(qhat, rhat, uhi, ulo, vhi)
-    var mhi, mlo: Word
-    var rhi, rlo: Word
-    mul(mhi, mlo, qhat, vlo)
-    rhi = rhat
-    rlo = ulo
+                                        # Assuming 64-bit words
+  let hi = a[^1]                        # Save the high word to detect carries
+  let R = mBits and (WordBitWidth - 1)  # R = mBits mod 64
 
-    # if r < m, adjust approximation, up to twice
-    while rhi < mhi or (rhi == mhi and rlo < mlo):
-      qhat -= 1
-      rhi += vhi
+  var a0, a1, m0: Word
+  if R == 0:                            # If the number of mBits is a multiple of 64
+    a0 = a[^1]                          #
+    copyWords(a, 1, a, 0, a.len-1)      # we can just shift words
+    a[0] = c                            # and replace the first one by c
+    a1 = a[^1]
+    m0 = M[^1]
+  else:                                 # Else: need to deal with partial word shifts at the edge.
+    let clz = WordBitWidth-R
+    a0 = (a[^1] shl clz) or (a[^2] shr R)
+    copyWords(a, 1, a, 0, a.len-1)
+    a[0] = c
+    a1 = (a[^1] shl clz) or (a[^2] shr R)
+    m0 = (M[^1] shl clz) or (M[^2] shr R)
 
-    # Found the quotient
-    q[j] = qhat
-
-    # un -= qhat * v
-    var borrow = Borrow(0)
-    var qvhi, qvlo: Word
-    for i in 0 ..< divisorLen-1:
-      mul(qvhi, qvlo, qhat, v[i])
-      subB(borrow, un[j+i], un[j+i], qvlo, borrow)
-      subB(borrow, un[j+i+1], un[j+i+1], qvhi, borrow)
-    # Last step
-    mul(qvhi, qvlo, qhat, v[divisorLen-1])
-    subB(borrow, un[j+divisorLen-1], un[j+divisorLen-1], qvlo, borrow)
-    qvhi += Word(borrow)
-    let isNeg = un[j+divisorLen] < qvhi
-    un[j+divisorLen] -= qvhi
-
-    if isNeg:
-      # oops, too big by one, add back
-      q[j] -= 1
-      var carry = Carry(0)
-      for i in 0 ..< divisorLen:
-        addC(carry, un[j+i], un[j+i], v[i], carry)
-
-  # Quotient is found, if remainder is needed we need to un-normalize un
-  if needRemainder:
-    # r.limbs.shrSmall(un, clz) - TODO
-    when cpuEndian == littleEndian:
-      # rLen+1 == un.len
-      for i in 0 ..< rLen:
-        r[i] = (un[i] shr clz) or (un[i+1] shl (WordBitWidth - clz))
-    else:
-      {.error: "Not Implemented for bigEndian".}
-
-
-const BinaryShiftThreshold = 8  # If the difference in bit-length is below 8
-                                # binary shift is probably faster
-
-func divmod(q, r: var Stuint,
-            x, y: Stuint, needRemainder: bool) =
-
-  let x_clz = x.leadingZeros()
-  let y_clz = y.leadingZeros()
-
-  # We short-circuit division depending on special-cases.
-  if unlikely(y.isZero()):
-    raise newException(DivByZeroError, "You attempted to divide by zero")
-  elif y_clz == (y.bits - 1):
-    # y is one
-    q = x
-  # elif (x.hi or y.hi).isZero:
-  #   # If computing just on the low part is enough
-  #   (result.quot.lo, result.rem.lo) = divmod(x.lo, y.lo, needRemainder)
-  # elif (y and (y - one(type y))).isZero:
-  #   # y is a power of 2. (this also matches 0 but it was eliminated earlier)
-  #   # TODO. Would it be faster to use countTrailingZero (ctz) + clz == size(y) - 1?
-  #   #       Especially because we shift by ctz after.
-  #   let y_ctz = bitsof(y) - y_clz - 1
-  #   result.quot = x shr y_ctz
-  #   if needRemainder:
-  #     result.rem = x and (y - one(type y))
-  elif x == y:
-    q.setOne()
-  elif x < y:
-    r = x
-  # elif (y_clz - x_clz) < BinaryShiftThreshold:
-  #   binaryShiftDiv(x, y, result.quot, result.rem)
+  # m0 has its high bit set. (a0, a1)/m0 fits in a limb.
+  # Get a quotient q, at most we will be 2 iterations off
+  # from the true quotient
+  var q: Word                           # Estimate quotient
+  if a0 == m0:                          # if a_hi == divisor
+    q = high(Word)                      # quotient = MaxWord (0b1111...1111)
+  elif a0 == 0 and a1 < m0:             # elif q == 0, true quotient = 0
+    q = 0
   else:
-    knuthDivLE(q, r, x, y, needRemainder)
+    var r: Word
+    div2n1n(q, r, a0, a1, m0)           # else instead of being of by 0, 1 or 2
+    q -= 1                              # we return q-1 to be off by -1, 0 or 1
+
+  # Now substract a*2^64 - q*m
+  var carry = Word(0)
+  var overM = true                      # Track if quotient greater than the modulus
+
+  for i in 0 ..< M.len:
+    var qm_lo: Word
+    block:                              # q*m
+      # q * p + carry (doubleword) carry from previous limb
+      muladd1(carry, qm_lo, q, M[i], carry)
+
+    block:                              # a*2^64 - q*m
+      var borrow: Borrow
+      subB(borrow, a[i], a[i], qm_lo, Borrow(0))
+      carry += Word(borrow) # Adjust if borrow
+
+    if a[i] != M[i]:
+      overM = a[i] > M[i]
+
+  # Fix quotient, the true quotient is either q-1, q or q+1
+  #
+  # if carry < q or carry == q and overM we must do "a -= M"
+  # if carry > hi (negative result) we must do "a += M"
+  if carry > hi:
+    var c = Carry(0)
+    for i in 0 ..< a.len:
+      addC(c, a[i], a[i], M[i], c)
+    q -= 1
+  elif overM or (carry < hi):
+    var b = Borrow(0)
+    for i in 0 ..< a.len:
+      subB(b, a[i], a[i], M[i], b)
+    q += 1
+
+  return q
+
+func shlAddMod(a: var openArray[Word], c: Word,
+               M: openArray[Word], mBits: int): Word {.inline.}=
+  ## Fused modular left-shift + add
+  ## Shift input `a` by a word and add `c` modulo `M`
+  ## 
+  ## With a word W = 2^WordBitWidth and a modulus M
+  ## Does a <- a * W + c (mod M)
+  ## and returns q = (a * W + c ) / M
+  ##
+  ## The modulus `M` most-significant bit at `mBits` MUST be set.
+  if mBits <= WordBitWidth:
+    # If M fits in a single limb
+
+    # We normalize M with clz so that the MSB is set
+    # And normalize (a * 2^64 + c) by R as well to maintain the result
+    # This ensures that (a0, a1)/p0 fits in a limb.
+    let R = mBits and (WordBitWidth - 1)
+    let clz = WordBitWidth-R
+
+    # (hi, lo) = a * 2^64 + c
+    let hi = (a[0] shl clz) or (c shr R)
+    let lo = c shl clz
+    let m0 = M[0] shl clz
+
+    var q, r: Word
+    div2n1n(q, r, hi, lo, m0)
+    a[0] = r shr clz
+    return q
+  else:
+    return shlAddMod_multi(a, c, M, mBits)
+
+func divRemImpl(
+       q, r: var openArray[Word],
+       a, b: openArray[Word]
+     ) =
+  let (aBits, aLen) = usedBitsAndWords(a)
+  let (bBits, bLen) = usedBitsAndWords(b)
+  let rLen = bLen
+
+  if aBits < bBits:
+    # if a uses less bits than b,
+    # a < b, so q = 0 and r = a
+    copyWords(r, 0, a, 0, aLen)
+    for i in aLen ..< r.len: # r.len >= rLen
+      r[i] = 0
+    for i in 0 ..< q.len:
+      q[i] = 0
+  else:
+    # The length of a is at least the divisor
+    # We can copy bLen-1 words
+    # and modular shift-lef-add the rest
+    let aOffset = aLen - bLen
+    copyWords(r, 0, a, aOffset+1, bLen-1)
+    r[rLen-1] = 0
+    # Now shift-left the copied words while adding the new word mod b
+    for i in countdown(aOffset, 0):
+      q[i] = shlAddMod(
+        r.toOpenArray(0, rLen-1),
+        a[i],
+        b.toOpenArray(0, bLen-1),
+        bBits
+      )
+
+    # Clean up extra words
+    for i in aOffset+1 ..< q.len:
+      q[i] = 0
+    for i in rLen ..< r.len:
+      r[i] = 0
 
 func `div`*(x, y: Stuint): Stuint {.inline.} =
   ## Division operation for multi-precision unsigned uint
   var tmp{.noInit.}: Stuint
-  divmod(result, tmp, x, y, needRemainder = false)
+  divRemImpl(result.limbs, tmp.limbs, x.limbs, y.limbs)
 
 func `mod`*(x, y: Stuint): Stuint {.inline.} =
   ## Remainder operation for multi-precision unsigned uint
   var tmp{.noInit.}: Stuint
-  divmod(tmp, result, x, y, needRemainder = true)
+  divRemImpl(tmp.limbs, result.limbs, x.limbs, y.limbs)
 
 func divmod*(x, y: Stuint): tuple[quot, rem: Stuint] =
   ## Division and remainder operations for multi-precision unsigned uint
-  divmod(result.quot, result.rem, x, y, needRemainder = true)
+  divRemImpl(result.quot.limbs, result.rem.limbs, x.limbs, y.limbs)
 
 # ######################################################################
 # Division implementations
 #
 # Multi-precision division is a costly
-#and also difficult to implement operation
+# and also difficult to implement operation
 
 # ##### Research #####
 
