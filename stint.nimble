@@ -18,47 +18,20 @@ proc test(name: string, lang: string = "c") =
   switch("out", ("./build/" & name))
   setCommand lang, "tests/" & name & ".nim"
 
-task test_internal_debug, "Run tests for internal procs - test implementation (StUint[64] = 2x uint32":
-  switch("define", "stint_test")
+task test_internal, "Run tests for internal procs":
   test "internal"
 
-task test_internal_release, "Run tests for internal procs - prod implementation (StUint[64] = uint64":
-  test "internal"
-
-task test_debug, "Run all tests - test implementation (StUint[64] = 2x uint32":
-  switch("define", "stint_test")
+task test_public_api, "Run all tests - prod implementation (StUint[64] = uint64":
   test "all_tests"
 
-task test_release, "Run all tests - prod implementation (StUint[64] = uint64":
-  test "all_tests"
-
-task test_property_debug, "Run random tests (debug mode) - test implementation (StUint[64] = 2x uint32)":
-  requires "https://github.com/alehander42/nim-quicktest >= 0.18.0"
-  switch("define", "stint_test")
-  test "property_based"
-
-task test_property_release, "Run random tests (release mode) - test implementation (StUint[64] = 2x uint32)":
-  requires "https://github.com/alehander42/nim-quicktest >= 0.18.0"
-  switch("define", "stint_test")
-  switch("define", "release")
-  test "property_based"
-
-task test_property_uint256_debug, "Run random tests Uint256 (debug mode) vs TTMath (StUint[256] = 8 x uint32)":
-  # TODO: another reference implementation?
-  requires "https://github.com/alehander42/nim-quicktest >= 0.18.0", "https://github.com/status-im/nim-ttmath"
-  test "property_based", "cpp"
-
-task test_property_uint256_release, "Run random tests Uint256 (release mode) vs TTMath (StUint[256] = 4 x uint64)":
-  # TODO: another reference implementation?
+task test_uint256_ttmath, "Run random tests Uint256 vs TTMath":
   requires "https://github.com/alehander42/nim-quicktest >= 0.18.0", "https://github.com/status-im/nim-ttmath"
   switch("define", "release")
-  test "property_based", "cpp"
+  test "uint256_ttmath", "cpp"
 
 task test, "Run all tests - test and production implementation":
-  exec "nimble test_internal_debug"
-  exec "nimble test_internal_release"
-  exec "nimble test_debug"
-  exec "nimble test_release"
+  exec "nimble test_internal"
+  exec "nimble test_public_api"
   ## TODO test only requirements don't work: https://github.com/nim-lang/nimble/issues/482
   # exec "nimble test_property_debug"
   # exec "nimble test_property_release"
