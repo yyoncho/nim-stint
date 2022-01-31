@@ -355,7 +355,7 @@ func dumpHex*(a: Stint or StUint, order: static[Endianness] = bigEndian): string
   let bytes = a.toBytes(order)
   result = bytes.toHex()
 
-export fromBytesBE
+export fromBytes, toBytes
 
 func readUintBE*[bits: static[int]](ba: openarray[byte]): Stuint[bits] {.noInit, inline.}=
   ## Convert a big-endian array of (bits div 8) Bytes to an UInt[bits] (in native host endianness)
