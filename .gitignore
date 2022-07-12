@@ -6,3 +6,5 @@
 
 nimcache/
 build/
+nimble.develop
+nimble.paths
